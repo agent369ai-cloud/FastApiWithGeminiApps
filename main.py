@@ -1,33 +1,46 @@
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Dict, List, Optional  # Added List and Optional for history
+from typing import Annotated, Dict, List, Optional
 import hashlib
 import secrets
-import os
+import sqlite3
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel  # 1. Added BaseModel for incoming JSON schemas
+from pydantic import BaseModel
 import jwt
 from google import genai
 from google.genai import types
 
-# Security Configurations
 SECRET_KEY = "super-secret-agentic-ai-key-change-this-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(
-    title="Agentic AI Secure Service",
-    version="1.0.0",
-    docs_url="/my-custom-docs",
-    redoc_url="/my-second-dashboard"
-)
-
-# Initialize Gemini Client (Expects GEMINI_API_KEY env variable)
+app = FastAPI(title="Multi-Session Agentic Service", version="1.0.0", docs_url="/my-custom-docs")
 client = genai.Client()
 
-# Helper Functions: Native Password Hashing
+DB_FILE = "chat_history.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # ADDED: session_id column to separate chats
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Native Hashing Configurations
 def hash_password(password: str, salt: bytes = None) -> str:
     if salt is None:
         salt = secrets.token_bytes(16)
@@ -42,7 +55,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except ValueError:
         return False
 
-# Mock Database
 USER_DB: Dict[str, Dict] = {
     "Testuser01": {"username": "Testuser01", "password_hash": hash_password("Admin@1234"), "role": "user"},
     "admin": {"username": "admin", "password_hash": hash_password("secretpassword"), "role": "admin"}
@@ -59,20 +71,16 @@ def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Dict:
     except jwt.PyJWTError:
         raise credentials_exception
 
-# --- AGENT TOOLS (Functions the AI can choose to run) ---
 def get_internal_system_status() -> str:
-    """Retrieves real-time raw performance data and connection metrics from the server environment."""
     return "Database: Connected | Active Connections: 42 | Memory Usage: 14% | API Gateway: Stable"
 
-
-# --- NEW: PYDANTIC SCHEMAS FOR CONVERSATION MEMORY ---
 class ChatMessage(BaseModel):
-    role: str      # Must be "user" or "assistant" from your Streamlit frontend
+    role: str
     content: str
 
 class AgentRequest(BaseModel):
     user_prompt: str
-    chat_history: Optional[List[ChatMessage]] = []
+    session_id: str  # Frontend passes which session this message belongs to
 
 
 # --- ENDPOINTS ---
@@ -87,47 +95,76 @@ def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     to_encode = {"sub": user["username"], "exp": expire}
     return {"access_token": jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM), "token_type": "bearer"}
 
-# MODIFIED: Changed from simple URL parameter to payload: AgentRequest JSON body
+# NEW ENDPOINT: Get all unique sessions for a user with their first message snippet
+@app.get("/sessions")
+def get_user_sessions(current_user: Annotated[Dict, Depends(get_current_user)]):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Pulls the first user message of each session to act as the chat title
+    cursor.execute("""
+        SELECT session_id, content FROM messages 
+        WHERE username = ? AND role = 'user'
+        GROUP BY session_id 
+        ORDER BY id DESC
+    """, (current_user["username"],))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"session_id": row[0], "title": row[1][:30]} for row in rows]
+
+# UPDATED: Get history filtered by a specific session_id
+@app.get("/history/{session_id}", response_model=List[ChatMessage])
+def get_session_history(session_id: str, current_user: Annotated[Dict, Depends(get_current_user)]):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT role, content FROM messages WHERE username = ? AND session_id = ? ORDER BY id ASC", 
+        (current_user["username"], session_id)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [ChatMessage(role=row[0], content=row[1]) for row in rows]
+
+# UPDATED: Saves and reads context matching the specific session_id
 @app.post("/agent")
 def run_ai_agent(payload: AgentRequest, current_user: Annotated[Dict, Depends(get_current_user)]):
     try:
-        # Define the system blueprint instructions for the Agent
+        username = current_user["username"]
         system_instruction = (
-            f"You are a secure autonomous systems agent working for user: {current_user['username']} "
-            f"with role: {current_user['role']}. You have access to real-time functions. Use them if necessary."
+            f"You are a secure autonomous systems agent working for user: {username} "
+            f"with role: {current_user['role']}. You have access to real-time functions."
         )
         
-        # 2. Reconstruct the full chat logs array matching Google SDK structural schemas
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, content FROM messages WHERE username = ? AND session_id = ? ORDER BY id ASC", 
+            (username, payload.session_id)
+        )
+        past_rows = cursor.fetchall()
+        
         contents = []
-        if payload.chat_history:
-            for msg in payload.chat_history:
-                # Convert Streamlit frontend "assistant" role identifier to Gemini SDK "model" expectation
-                api_role = "model" if msg.role == "assistant" else msg.role
-                contents.append(types.Content(
-                    role=api_role,
-                    parts=[types.Part.from_text(text=msg.content)]
-                ))
+        for row in past_rows:
+            api_role = "model" if row[0] == "assistant" else row[0]
+            contents.append(types.Content(role=api_role, parts=[types.Part.from_text(text=row[1])]))
+            
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=payload.user_prompt)]))
         
-        # Append the latest turn to the tail end of the array sequence
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=payload.user_prompt)]
-        ))
-        
-        # Invoke the LLM passing the historical contents array instead of a single prompt string
         response = client.models.generate_content(
             model='gemini-3.5-flash',
-            contents=contents, # Changed from user_prompt string to historical structural list
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 tools=[get_internal_system_status], 
             )
         )
+        
+        # Save to database along with the session identifier
+        cursor.execute("INSERT INTO messages (username, session_id, role, content) VALUES (?, ?, ?, ?)", (username, payload.session_id, "user", payload.user_prompt))
+        cursor.execute("INSERT INTO messages (username, session_id, role, content) VALUES (?, ?, ?, ?)", (username, payload.session_id, "assistant", response.text))
+        conn.commit()
+        conn.close()
+        
         return {"agent_response": response.text}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent Execution Failure: {str(e)}")
-
-@app.get("/")
-def read_root():
-    return {"message": "Public access allowed."}
