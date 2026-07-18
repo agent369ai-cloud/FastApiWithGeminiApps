@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Dict
+from typing import Annotated, Dict, List, Optional  # Added List and Optional for history
 import hashlib
 import secrets
 import os
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel  # 1. Added BaseModel for incoming JSON schemas
 import jwt
 from google import genai
 from google.genai import types
@@ -64,6 +65,16 @@ def get_internal_system_status() -> str:
     return "Database: Connected | Active Connections: 42 | Memory Usage: 14% | API Gateway: Stable"
 
 
+# --- NEW: PYDANTIC SCHEMAS FOR CONVERSATION MEMORY ---
+class ChatMessage(BaseModel):
+    role: str      # Must be "user" or "assistant" from your Streamlit frontend
+    content: str
+
+class AgentRequest(BaseModel):
+    user_prompt: str
+    chat_history: Optional[List[ChatMessage]] = []
+
+
 # --- ENDPOINTS ---
 
 @app.post("/token")
@@ -76,9 +87,9 @@ def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     to_encode = {"sub": user["username"], "exp": expire}
     return {"access_token": jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM), "token_type": "bearer"}
 
-# NEW: AGENTIC AI ENDPOINT (Securely processes natural language instructions)
+# MODIFIED: Changed from simple URL parameter to payload: AgentRequest JSON body
 @app.post("/agent")
-def run_ai_agent(user_prompt: str, current_user: Annotated[Dict, Depends(get_current_user)]):
+def run_ai_agent(payload: AgentRequest, current_user: Annotated[Dict, Depends(get_current_user)]):
     try:
         # Define the system blueprint instructions for the Agent
         system_instruction = (
@@ -86,13 +97,30 @@ def run_ai_agent(user_prompt: str, current_user: Annotated[Dict, Depends(get_cur
             f"with role: {current_user['role']}. You have access to real-time functions. Use them if necessary."
         )
         
-        # Invoke the LLM with native function capabilities (Tool Use)
+        # 2. Reconstruct the full chat logs array matching Google SDK structural schemas
+        contents = []
+        if payload.chat_history:
+            for msg in payload.chat_history:
+                # Convert Streamlit frontend "assistant" role identifier to Gemini SDK "model" expectation
+                api_role = "model" if msg.role == "assistant" else msg.role
+                contents.append(types.Content(
+                    role=api_role,
+                    parts=[types.Part.from_text(text=msg.content)]
+                ))
+        
+        # Append the latest turn to the tail end of the array sequence
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=payload.user_prompt)]
+        ))
+        
+        # Invoke the LLM passing the historical contents array instead of a single prompt string
         response = client.models.generate_content(
             model='gemini-3.5-flash',
-            contents=user_prompt,
+            contents=contents, # Changed from user_prompt string to historical structural list
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                tools=[get_internal_system_status], # Giving the function tool to the agent
+                tools=[get_internal_system_status], 
             )
         )
         return {"agent_response": response.text}
