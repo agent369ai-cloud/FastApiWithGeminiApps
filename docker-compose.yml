@@ -1,21 +1,37 @@
 version: '3.8'
 
 services:
-  # 1. THE FASTAPI BACKEND SERVICE
+  # 1. THE PRODUCTION POSTGRESQL DATABASE SERVICE
+  postgres_db:
+    image: postgres:16-alpine
+    container_name: agentic_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: agent_admin
+      POSTGRES_PASSWORD: secure_db_password_123
+      POSTGRES_DB: agentic_chat_db
+    ports:
+      - "5432:5432"
+    volumes:
+      # Saves database entries natively onto the server host disk volume
+      - pgdata:/var/lib/postgresql/data
+
+  # 2. THE FASTAPI BACKEND SERVICE
   backend:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY} # Replace with your fresh re-generated key
+    env_file:
+      - .env  # Safely injects variables (GEMINI_API_KEY, JWT_SECRET_KEY) from your file
     volumes:
-      # Persistent Storage: Maps a folder named 'data' on your server disk to the app folder inside the container
       - ./data:/app/data_store
+    depends_on:
+      - postgres_db  # Forces the database container to initialize before the API boots
     restart: always
-
-  # 2. THE STREAMLIT FRONTEND SERVICE
+  
+  # 3. THE STREAMLIT FRONTEND SERVICE
   frontend:
     image: python:3.11-slim
     ports:
@@ -24,4 +40,10 @@ services:
       - .:/app
     working_dir: /app
     command: sh -c "pip install streamlit requests && streamlit run app_frontend.py --server.address 0.0.0.0 --server.port 8501"
+    depends_on:
+      - backend  # Forces frontend to wait until the backend API layer is running
     restart: always
+
+# Global Volume Declarations for PostgreSQL Data Persistence
+volumes:
+  pgdata:

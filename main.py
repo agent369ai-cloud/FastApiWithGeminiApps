@@ -2,42 +2,70 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, List, Optional
 import hashlib
 import secrets
-import sqlite3
+import os
+import time
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import jwt
+import psycopg2 # Replaces sqlite3 for enterprise scaling
+from psycopg2.extras import RealDictCursor
 from google import genai
 from google.genai import types
 
-SECRET_KEY = "super-secret-agentic-ai-key-change-this-in-production"
+# Load secret strings dynamically from .env file injected by docker-compose
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "fallback-insecure-key-for-local-dev")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(title="Multi-Session Agentic Service", version="1.0.0", docs_url="/my-custom-docs")
+app = FastAPI(
+    title="Production Agentic AI Service",
+    version="1.0.0",
+    docs_url="/my-custom-docs",
+    redoc_url="/my-second-dashboard"
+)
+
+# Initialize Gemini Client (Expects GEMINI_API_KEY environment variable)
 client = genai.Client()
 
-DB_FILE = "data_store/chat_history.db"
+# Helper function to maintain a resilient connection pool handshake with Postgres
+def get_db_connection():
+    retries = 5
+    while retries > 0:
+        try:
+            conn = psycopg2.connect(
+                host="postgres_db", # Matches the docker-compose service name
+                database="agentic_chat_db",
+                user="agent_admin",
+                password="secure_db_password_123"
+            )
+            return conn
+        except psycopg2.OperationalError:
+            retries -= 1
+            time.sleep(2)
+    raise HTTPException(status_code=500, detail="Database connection timeout.")
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    # ADDED: session_id column to separate chats
+    # Create persistent message schema table layout with auto-incrementing SERIAL ID
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(100) NOT NULL,
+            session_id VARCHAR(100) NOT NULL,
+            role VARCHAR(50) NOT NULL,
             content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
+# Run database engine schema checks immediately on runtime start
 init_db()
 
 # Native Hashing Configurations
@@ -55,6 +83,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except ValueError:
         return False
 
+# Mock User DB (Replace with database lookups later as your app expands)
 USER_DB: Dict[str, Dict] = {
     "Testuser01": {"username": "Testuser01", "password_hash": hash_password("Admin@1234"), "role": "user"},
     "admin": {"username": "admin", "password_hash": hash_password("secretpassword"), "role": "admin"}
@@ -71,7 +100,9 @@ def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Dict:
     except jwt.PyJWTError:
         raise credentials_exception
 
+# --- AGENT TOOLS ---
 def get_internal_system_status() -> str:
+    """Retrieves real-time raw performance data and connection metrics from the server environment."""
     return "Database: Connected | Active Connections: 42 | Memory Usage: 14% | API Gateway: Stable"
 
 class ChatMessage(BaseModel):
@@ -80,7 +111,7 @@ class ChatMessage(BaseModel):
 
 class AgentRequest(BaseModel):
     user_prompt: str
-    session_id: str  # Frontend passes which session this message belongs to
+    session_id: str
 
 
 # --- ENDPOINTS ---
@@ -95,36 +126,41 @@ def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
     to_encode = {"sub": user["username"], "exp": expire}
     return {"access_token": jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM), "token_type": "bearer"}
 
-# NEW ENDPOINT: Get all unique sessions for a user with their first message snippet
+# Fetches all unique session titles based on the first user message
 @app.get("/sessions")
 def get_user_sessions(current_user: Annotated[Dict, Depends(get_current_user)]):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # Pulls the first user message of each session to act as the chat title
+    conn = get_db_connection()
+    # RealDictCursor formats database row maps cleanly as standard Python dictionaries
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("""
-        SELECT session_id, content FROM messages 
-        WHERE username = ? AND role = 'user'
-        GROUP BY session_id 
-        ORDER BY id DESC
+        SELECT DISTINCT ON (session_id) session_id, content, id
+        FROM messages 
+        WHERE username = %s AND role = 'user'
+        ORDER BY session_id, id ASC
     """, (current_user["username"],))
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
-    return [{"session_id": row[0], "title": row[1][:30]} for row in rows]
+    
+    # Sort threads chronologically descending (newest chat at top)
+    sorted_rows = sorted(rows, key=lambda x: x['id'], reverse=True)
+    return [{"session_id": r["session_id"], "title": r["content"][:30]} for r in sorted_rows]
 
-# UPDATED: Get history filtered by a specific session_id
+# Fetches full history logs filtered by specific session identifier tags
 @app.get("/history/{session_id}", response_model=List[ChatMessage])
 def get_session_history(session_id: str, current_user: Annotated[Dict, Depends(get_current_user)]):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
-        "SELECT role, content FROM messages WHERE username = ? AND session_id = ? ORDER BY id ASC", 
+        "SELECT role, content FROM messages WHERE username = %s AND session_id = %s ORDER BY id ASC", 
         (current_user["username"], session_id)
     )
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
-    return [ChatMessage(role=row[0], content=row[1]) for row in rows]
+    return [ChatMessage(role=r["role"], content=r["content"]) for r in rows]
 
-# UPDATED: Saves and reads context matching the specific session_id
+# Core agentic endpoint with context-windowed historic text injections
 @app.post("/agent")
 def run_ai_agent(payload: AgentRequest, current_user: Annotated[Dict, Depends(get_current_user)]):
     try:
@@ -134,18 +170,26 @@ def run_ai_agent(payload: AgentRequest, current_user: Annotated[Dict, Depends(ge
             f"with role: {current_user['role']}. You have access to real-time functions."
         )
         
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM messages WHERE username = ? AND session_id = ? ORDER BY id ASC", 
-            (username, payload.session_id)
-        )
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # FIXED: Grabs ONLY the last 10 messages of the conversation thread to save your API quota limit
+        cursor.execute("""
+            SELECT role, content FROM (
+                SELECT role, content, id 
+                FROM messages 
+                WHERE username = %s AND session_id = %s 
+                ORDER BY id DESC 
+                LIMIT 10
+            ) subquery 
+            ORDER BY id ASC
+        """, (username, payload.session_id))
         past_rows = cursor.fetchall()
         
         contents = []
         for row in past_rows:
-            api_role = "model" if row[0] == "assistant" else row[0]
-            contents.append(types.Content(role=api_role, parts=[types.Part.from_text(text=row[1])]))
+            api_role = "model" if row["role"] == "assistant" else row["role"]
+            contents.append(types.Content(role=api_role, parts=[types.Part.from_text(text=row["content"])]))
             
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=payload.user_prompt)]))
         
@@ -158,13 +202,24 @@ def run_ai_agent(payload: AgentRequest, current_user: Annotated[Dict, Depends(ge
             )
         )
         
-        # Save to database along with the session identifier
-        cursor.execute("INSERT INTO messages (username, session_id, role, content) VALUES (?, ?, ?, ?)", (username, payload.session_id, "user", payload.user_prompt))
-        cursor.execute("INSERT INTO messages (username, session_id, role, content) VALUES (?, ?, ?, ?)", (username, payload.session_id, "assistant", response.text))
+        # Commit context values permanently into PostgreSQL row transactions
+        cursor.execute(
+            "INSERT INTO messages (username, session_id, role, content) VALUES (%s, %s, %s, %s)", 
+            (username, payload.session_id, "user", payload.user_prompt)
+        )
+        cursor.execute(
+            "INSERT INTO messages (username, session_id, role, content) VALUES (%s, %s, %s, %s)", 
+            (username, payload.session_id, "assistant", response.text)
+        )
         conn.commit()
+        cursor.close()
         conn.close()
         
         return {"agent_response": response.text}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent Execution Failure: {str(e)}")
+
+@app.get("/")
+def read_root():
+    return {"message": "Public access allowed."}

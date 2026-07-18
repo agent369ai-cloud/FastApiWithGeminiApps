@@ -14,9 +14,9 @@ if "current_session" not in st.session_state:
 if "sessions_list" not in st.session_state:
     st.session_state.sessions_list = []
 
-BACKEND_URL = "http://localhost:8000" 
+# FIXED: Points directly to the FastAPI service name in your docker-compose file
+BACKEND_URL = "http://backend:8000" 
 
-# Helper function to load all chat threads from backend
 def refresh_sessions_sidebar(headers):
     try:
         res = requests.get(f"{BACKEND_URL}/sessions", headers=headers)
@@ -25,7 +25,7 @@ def refresh_sessions_sidebar(headers):
     except Exception:
         pass
 
-# --- 1. LOGIN & SIDEBAR ---
+# --- 1. LOGIN & SIDEBAR PORTAL ---
 if not st.session_state.token:
     with st.sidebar.form("login_form"):
         st.subheader("System Authentication")
@@ -35,10 +35,10 @@ if not st.session_state.token:
         
         if login_btn:
             try:
+                # Routes perfectly through the internal Docker network mesh
                 res = requests.post(f"{BACKEND_URL}/token", data={"username": username, "password": password})
                 if res.status_code == 200:
                     st.session_state.token = res.json()["access_token"]
-                    # Default initialization to a brand new session tracking ID string
                     st.session_state.current_session = f"session_{int(time.time())}"
                     st.session_state.messages = []
                     st.success(f"Logged in as {username}!")
@@ -51,7 +51,6 @@ else:
     headers = {"Authorization": f"Bearer {st.session_state.token}"}
     st.sidebar.success("🔒 Authenticated Session Active")
     
-    # ➕ NEW CHAT BUTTON BUTTON
     if st.sidebar.button("➕ New Chat", use_container_width=True):
         st.session_state.current_session = f"session_{int(time.time())}"
         st.session_state.messages = []
@@ -59,21 +58,17 @@ else:
 
     st.sidebar.markdown("---")
     
-    # Fetch lists of conversations from the backend SQLite DB
     refresh_sessions_sidebar(headers)
     
     st.sidebar.markdown("### 📜 Past Chats & Topics")
     if st.session_state.sessions_list:
         for sess in st.session_state.sessions_list:
-            # Create a clickable toggle link button for every historical session
             button_label = f"💬 {sess['title']}..."
-            # Highlight active conversation thread
             if st.session_state.current_session == sess['session_id']:
                 button_label = f"➡️ {sess['title']}..."
                 
             if st.sidebar.button(button_label, key=sess['session_id'], use_container_width=True):
                 st.session_state.current_session = sess['session_id']
-                # Fetch history specific to the selected link slot code
                 hist_res = requests.get(f"{BACKEND_URL}/history/{sess['session_id']}", headers=headers)
                 if hist_res.status_code == 200:
                     st.session_state.messages = hist_res.json()
@@ -89,9 +84,8 @@ else:
         st.session_state.sessions_list = []
         st.rerun()
 
-# --- 2. CHAT WORKSPACE CONTEXT ---
+# --- 2. ACTIVE DISCUSSION WORKSPACE ---
 if st.session_state.token:
-    # Display the filtered past items
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
@@ -108,7 +102,7 @@ if st.session_state.token:
         }
         json_payload = {
             "user_prompt": prompt,
-            "session_id": st.session_state.current_session # Passes active session state
+            "session_id": st.session_state.current_session
         }
         
         try:
