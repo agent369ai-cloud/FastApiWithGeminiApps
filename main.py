@@ -19,7 +19,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 app = FastAPI(title="Multi-Session Agentic Service", version="1.0.0", docs_url="/my-custom-docs")
 client = genai.Client()
 
-DB_FILE = "chat_history.db"
+DB_FILE = "data_store/chat_history.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)

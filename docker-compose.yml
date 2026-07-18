@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  # 1. THE FASTAPI BACKEND SERVICE
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY} # Replace with your fresh re-generated key
+    volumes:
+      # Persistent Storage: Maps a folder named 'data' on your server disk to the app folder inside the container
+      - ./data:/app/data_store
+    restart: always
+
+  # 2. THE STREAMLIT FRONTEND SERVICE
+  frontend:
+    image: python:3.11-slim
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: sh -c "pip install streamlit requests && streamlit run app_frontend.py --server.address 0.0.0.0 --server.port 8501"
+    restart: always
